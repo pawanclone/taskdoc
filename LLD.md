@@ -87,13 +87,13 @@ Controller doesn't know about transactions. Service doesn't know about HTTP. Mod
 
 ```mermaid
 erDiagram
-    users ||--o{ sales : "has many"
-    users ||--o{ payouts : "requests"
-    users ||--|| user_balances : "has one"
-    users ||--o{ payout_adjustments : "receives"
-    sales ||--o{ advance_payouts : "may receive"
-    sales ||--o{ payout_adjustments : "triggers"
-    payouts ||--o{ payout_adjustments : "may trigger"
+    users ||--o{ sales : has
+    users ||--o{ payouts : requests
+    users ||--|| user_balances : has
+    users ||--o{ payout_adjustments : receives
+    sales ||--o{ advance_payouts : receives
+    sales ||--o{ payout_adjustments : triggers
+    payouts ||--o{ payout_adjustments : triggers
 
     users {
         TEXT id PK
@@ -106,12 +106,14 @@ erDiagram
     sales {
         TEXT id PK
         TEXT user_id FK
-        TEXT brand "brand_1 or brand_2 or brand_3"
-        TEXT status "pending or approved or rejected"
-        REAL earning "CHECK >= 0"
-        REAL advance_paid "DEFAULT 0"
-        INT advance_transferred "0 or 1 boolean"
-        INT reconciled "0 or 1 boolean"
+        TEXT brand
+        TEXT status
+        REAL earning
+        REAL advance_paid
+        INT advance_transferred
+        INT reconciled
+        TEXT created_at
+        TEXT updated_at
     }
 
     advance_payouts {
@@ -125,32 +127,48 @@ erDiagram
     payouts {
         TEXT id PK
         TEXT user_id FK
-        REAL amount "CHECK > 0"
-        TEXT status "initiated or completed or failed"
-        TEXT failure_reason "nullable"
+        REAL amount
+        TEXT status
+        TEXT failure_reason
         TEXT initiated_at
-        TEXT completed_at "nullable"
+        TEXT completed_at
+        TEXT updated_at
     }
 
     payout_adjustments {
         TEXT id PK
         TEXT user_id FK
-        TEXT sale_id FK "nullable"
-        TEXT payout_id FK "nullable"
-        TEXT type "advance or reconciliation or failed"
+        TEXT sale_id FK
+        TEXT payout_id FK
+        TEXT type
         REAL amount
-        TEXT description "nullable"
+        TEXT description
+        TEXT created_at
     }
 
     user_balances {
-        TEXT user_id PK_FK
-        REAL withdrawable_balance "DEFAULT 0"
-        REAL total_earned "DEFAULT 0"
-        REAL total_advance_paid "DEFAULT 0"
-        REAL total_withdrawn "DEFAULT 0"
-        TEXT last_withdrawal_at "nullable"
+        TEXT user_id PK
+        REAL withdrawable_balance
+        REAL total_earned
+        REAL total_advance_paid
+        REAL total_withdrawn
+        TEXT last_withdrawal_at
+        TEXT updated_at
     }
 ```
+
+**Column constraints** (enforced at DB level):
+
+| Table | Column | Constraint |
+|-------|--------|------------|
+| sales | brand | `CHECK IN (brand_1, brand_2, brand_3)` |
+| sales | status | `CHECK IN (pending, approved, rejected)` |
+| sales | earning | `CHECK >= 0` |
+| sales | advance_transferred | `0` (no) or `1` (yes) — idempotency flag |
+| payouts | amount | `CHECK > 0` |
+| payouts | status | `CHECK IN (initiated, processing, completed, failed, cancelled, rejected)` |
+| payout_adjustments | type | `CHECK IN (advance_credit, reconciliation_credit, reconciliation_debit, failed_payout_credit)` |
+| user_balances | all REAL columns | `DEFAULT 0` |
 
 ---
 
@@ -406,34 +424,61 @@ sequenceDiagram
 
 ## 8. Complete Example Walkthrough (from Problem Statement)
 
-### Visual Flow
+### Sale A Journey (REJECTED)
 
 ```mermaid
 flowchart LR
-    subgraph S1["1️⃣ Create Sales"]
-        direction TB
-        SA["Sale A: Rs.40"]
-        SB["Sale B: Rs.40"]
-        SC["Sale C: Rs.40"]
-    end
+    A1["Sale A Created\nEarning: Rs.40\nStatus: PENDING"] --> A2["Advance Paid\n10% = Rs.4\nBalance: +Rs.4"] --> A3["Admin: REJECTED\nClawback: -Rs.4\nNet: Rs.0"]
 
-    subgraph S2["2️⃣ Advance 10%"]
-        direction TB
-        AA["A: +Rs.4"]
-        AB["B: +Rs.4"]
-        AC["C: +Rs.4"]
-        B1(("Bal: Rs.12"))
-    end
+    style A1 fill:#3498db,color:#fff
+    style A2 fill:#f39c12,color:#fff
+    style A3 fill:#e74c3c,color:#fff
+```
 
-    subgraph S3["3️⃣ Reconcile"]
-        direction TB
-        RA["A Rejected: -Rs.4"]
-        RB["B Approved: +Rs.36"]
-        RC["C Approved: +Rs.36"]
-        B2(("Bal: Rs.80"))
-    end
+### Sale B Journey (APPROVED)
 
-    S1 ==> S2 ==> S3
+```mermaid
+flowchart LR
+    B1["Sale B Created\nEarning: Rs.40\nStatus: PENDING"] --> B2["Advance Paid\n10% = Rs.4\nBalance: +Rs.4"] --> B3["Admin: APPROVED\nRemainder: Rs.40 - Rs.4 = Rs.36\nNet: Rs.40"]
+
+    style B1 fill:#3498db,color:#fff
+    style B2 fill:#f39c12,color:#fff
+    style B3 fill:#27ae60,color:#fff
+```
+
+### Sale C Journey (APPROVED)
+
+```mermaid
+flowchart LR
+    C1["Sale C Created\nEarning: Rs.40\nStatus: PENDING"] --> C2["Advance Paid\n10% = Rs.4\nBalance: +Rs.4"] --> C3["Admin: APPROVED\nRemainder: Rs.40 - Rs.4 = Rs.36\nNet: Rs.40"]
+
+    style C1 fill:#3498db,color:#fff
+    style C2 fill:#f39c12,color:#fff
+    style C3 fill:#27ae60,color:#fff
+```
+
+### Combined Result
+
+```mermaid
+flowchart TD
+    T["Total Pending Earnings = Rs.120"]
+    T --> ADV["Advance Payout = 10% of Rs.120 = Rs.12"]
+    ADV --> R{"Reconciliation"}
+    R --> REJ["Sale A REJECTED\nAdjustment: -Rs.4"]
+    R --> AP1["Sale B APPROVED\nAdjustment: +Rs.36"]
+    R --> AP2["Sale C APPROVED\nAdjustment: +Rs.36"]
+    REJ --> FINAL["Final Payout = -Rs.4 + Rs.36 + Rs.36 = Rs.68"]
+    AP1 --> FINAL
+    AP2 --> FINAL
+    FINAL --> BAL["Withdrawable Balance = Rs.80\n(Rs.12 advance + Rs.68 final)"]
+
+    style T fill:#3498db,color:#fff
+    style ADV fill:#f39c12,color:#fff
+    style REJ fill:#e74c3c,color:#fff
+    style AP1 fill:#27ae60,color:#fff
+    style AP2 fill:#27ae60,color:#fff
+    style FINAL fill:#8e44ad,color:#fff
+    style BAL fill:#2c3e50,color:#fff
 ```
 
 ### Step-by-Step Balance Trace
@@ -457,17 +502,17 @@ flowchart LR
 
 ## 9. Class Design (UML-style)
 
-### Models (Data Access)
-
 ```mermaid
 classDiagram
+    direction TB
+
     class User {
         +String id
         +String name
         +String email
-        +create(name, email) User
-        +findById(id) User
-        +findAll() User[]
+        +create(name, email)
+        +findById(id)
+        +findAll()
     }
 
     class Sale {
@@ -478,9 +523,9 @@ classDiagram
         +Number earning
         +Number advance_paid
         +Boolean advance_transferred
-        +create(userId, brand, earning) Sale
-        +findPendingWithoutAdvance(userId) Sale[]
-        +markAdvanceTransferred(saleId, amount)
+        +create(userId, brand, earning)
+        +findPendingWithoutAdvance(userId)
+        +markAdvanceTransferred(saleId, amt)
         +updateStatus(saleId, status)
     }
 
@@ -489,16 +534,16 @@ classDiagram
         +String user_id
         +Number amount
         +String status
-        +create(userId, amount) Payout
+        +create(userId, amount)
         +updateStatus(id, status, reason)
-        +hasRecentWithdrawal(userId) Boolean
+        +hasRecentWithdrawal(userId)
     }
 
     class UserBalance {
         +Number withdrawable_balance
         +Number total_earned
         +Number total_withdrawn
-        +getBalance(userId) Balance
+        +getBalance(userId)
         +credit(userId, amount)
         +debit(userId, amount)
         +recordWithdrawal(userId, amount)
@@ -509,43 +554,48 @@ classDiagram
         +String id
         +String type
         +Number amount
-        +create(params) Adjustment
-        +findByUser(userId) Adjustment[]
+        +create(params)
+        +findByUser(userId)
     }
 
-    User "1" --> "*" Sale : owns
-    User "1" --> "1" UserBalance : has
-    User "1" --> "*" Payout : requests
-```
-
-### Services (Business Logic)
-
-```mermaid
-classDiagram
     class AdvancePayoutService {
-        +processForUser(userId) Result
-        +processAll() BatchResult
+        +processForUser(userId)
+        +processAll()
     }
 
     class ReconciliationService {
-        +reconcileSale(saleId, status) Result
-        +batchReconcile(items) BatchResult
-        +calculateFinalPayout(userId) Summary
+        +reconcileSale(saleId, status)
+        +batchReconcile(items)
+        +calculateFinalPayout(userId)
     }
 
     class WithdrawalService {
-        +initiateWithdrawal(userId, amount) Payout
-        +completePayout(payoutId) Payout
-        +handleFailedPayout(payoutId, status, reason) Result
+        +initiateWithdrawal(userId, amount)
+        +completePayout(payoutId)
+        +handleFailedPayout(payoutId, status)
     }
 
-    AdvancePayoutService ..> Sale : reads/writes
-    AdvancePayoutService ..> UserBalance : credits
-    ReconciliationService ..> Sale : updates status
-    ReconciliationService ..> UserBalance : credits/debits
-    WithdrawalService ..> Payout : creates/updates
-    WithdrawalService ..> UserBalance : debits/credits
+    User "1" --o "*" Sale : owns
+    User "1" --o "1" UserBalance : has
+    User "1" --o "*" Payout : requests
+
+    AdvancePayoutService ..> Sale : uses
+    AdvancePayoutService ..> UserBalance : uses
+    AdvancePayoutService ..> PayoutAdjustment : logs
+
+    ReconciliationService ..> Sale : uses
+    ReconciliationService ..> UserBalance : uses
+    ReconciliationService ..> PayoutAdjustment : logs
+
+    WithdrawalService ..> Payout : uses
+    WithdrawalService ..> UserBalance : uses
+    WithdrawalService ..> PayoutAdjustment : logs
 ```
+
+**How to read this diagram:**
+- **Solid lines** (User → Sale/Payout/Balance) = data ownership relationships
+- **Dotted lines** (Service → Model) = service depends on model for operations
+- All three services write to `PayoutAdjustment` for the immutable audit trail
 
 ---
 
