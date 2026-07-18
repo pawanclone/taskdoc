@@ -500,12 +500,12 @@ flowchart TD
 
 ---
 
-## 9. Class Design (UML-style)
+## 9. Class Design
+
+### 9.1 Models (Data Access Layer)
 
 ```mermaid
 classDiagram
-    direction TB
-
     class User {
         +String id
         +String name
@@ -557,45 +557,56 @@ classDiagram
         +create(params)
         +findByUser(userId)
     }
-
-    class AdvancePayoutService {
-        +processForUser(userId)
-        +processAll()
-    }
-
-    class ReconciliationService {
-        +reconcileSale(saleId, status)
-        +batchReconcile(items)
-        +calculateFinalPayout(userId)
-    }
-
-    class WithdrawalService {
-        +initiateWithdrawal(userId, amount)
-        +completePayout(payoutId)
-        +handleFailedPayout(payoutId, status)
-    }
-
-    User "1" --o "*" Sale : owns
-    User "1" --o "1" UserBalance : has
-    User "1" --o "*" Payout : requests
-
-    AdvancePayoutService ..> Sale : uses
-    AdvancePayoutService ..> UserBalance : uses
-    AdvancePayoutService ..> PayoutAdjustment : logs
-
-    ReconciliationService ..> Sale : uses
-    ReconciliationService ..> UserBalance : uses
-    ReconciliationService ..> PayoutAdjustment : logs
-
-    WithdrawalService ..> Payout : uses
-    WithdrawalService ..> UserBalance : uses
-    WithdrawalService ..> PayoutAdjustment : logs
 ```
 
-**How to read this diagram:**
-- **Solid lines** (User → Sale/Payout/Balance) = data ownership relationships
-- **Dotted lines** (Service → Model) = service depends on model for operations
-- All three services write to `PayoutAdjustment` for the immutable audit trail
+### 9.2 Service → Model Dependency Map
+
+Each service orchestrates multiple models inside a single database transaction.
+
+```mermaid
+flowchart LR
+    subgraph Services
+        APS["AdvancePayoutService"]
+        RS["ReconciliationService"]
+        WS["WithdrawalService"]
+    end
+
+    subgraph Models
+        S["Sale"]
+        UB["UserBalance"]
+        P["Payout"]
+        PA["PayoutAdjustment"]
+    end
+
+    APS --> S
+    APS --> UB
+    APS --> PA
+
+    RS --> S
+    RS --> UB
+    RS --> PA
+
+    WS --> P
+    WS --> UB
+    WS --> PA
+```
+
+### 9.3 Data Ownership (User → Entities)
+
+```mermaid
+flowchart TD
+    U["User"] --> S["Sales (many)"]
+    U --> P["Payouts (many)"]
+    U --> UB["UserBalance (one)"]
+    S --> PA1["PayoutAdjustments"]
+    P --> PA2["PayoutAdjustments"]
+```
+
+**Key observations:**
+- All 3 services depend on `UserBalance` — it is the central model
+- All 3 services log to `PayoutAdjustment` — the immutable audit trail
+- `AdvancePayoutService` and `ReconciliationService` share access to `Sale`
+- Only `WithdrawalService` accesses `Payout`
 
 ---
 
