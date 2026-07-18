@@ -20,61 +20,52 @@ Build a system to manage affiliate sale payouts with:
 ## 2. High-Level Architecture
 
 ```mermaid
-graph TB
-    subgraph Client
-        A[REST Client / Admin Panel]
+graph TD
+    Client["🖥️ REST Client"]
+
+    Client -->|HTTP/JSON| API
+
+    subgraph API["API Layer"]
+        Router --> UsersCtrl["UsersController"]
+        Router --> SalesCtrl["SalesController"]
+        Router --> PayoutCtrl["PayoutController"]
     end
 
-    subgraph API["API Layer (Express.js)"]
-        R[Router] --> UC[UsersController]
-        R --> SC[SalesController]
-        R --> PC[PayoutController]
+    subgraph BIZ["Service Layer"]
+        AdvanceSvc["AdvancePayoutService"]
+        ReconSvc["ReconciliationService"]
+        WithdrawSvc["WithdrawalService"]
     end
 
-    subgraph Services["Service Layer (Business Logic)"]
-        APS[AdvancePayoutService]
-        RS[ReconciliationService]
-        WS[WithdrawalService]
+    subgraph DATA["Model Layer"]
+        UserModel["User"]
+        SaleModel["Sale"]
+        PayoutModel["Payout"]
+        BalanceModel["UserBalance"]
+        AuditModel["PayoutAdjustment"]
     end
 
-    subgraph Models["Model Layer (Data Access)"]
-        UM[User]
-        SM[Sale]
-        PM[Payout]
-        UBM[UserBalance]
-        PAM[PayoutAdjustment]
+    subgraph DB["SQLite Database"]
+        direction LR
+        T1[("users")]
+        T2[("sales")]
+        T3[("payouts")]
+        T4[("user_balances")]
+        T5[("payout_adjustments")]
     end
 
-    subgraph DB["Database (SQLite + WAL)"]
-        T1[(users)]
-        T2[(sales)]
-        T3[(advance_payouts)]
-        T4[(payouts)]
-        T5[(payout_adjustments)]
-        T6[(user_balances)]
-    end
+    PayoutCtrl --> AdvanceSvc
+    PayoutCtrl --> ReconSvc
+    PayoutCtrl --> WithdrawSvc
 
-    A -->|HTTP JSON| R
-    UC --> APS
-    SC --> APS
-    PC --> APS
-    PC --> RS
-    PC --> WS
-    APS --> SM
-    APS --> UBM
-    APS --> PAM
-    RS --> SM
-    RS --> UBM
-    RS --> PAM
-    WS --> PM
-    WS --> UBM
-    WS --> PAM
-    UM --> T1
-    SM --> T2
-    SM --> T3
-    PM --> T4
-    PAM --> T5
-    UBM --> T6
+    AdvanceSvc --> SaleModel
+    AdvanceSvc --> BalanceModel
+    ReconSvc --> SaleModel
+    ReconSvc --> BalanceModel
+    WithdrawSvc --> PayoutModel
+    WithdrawSvc --> BalanceModel
+
+    DATA --> DB
 ```
 
 ### Layer Responsibilities
@@ -115,14 +106,12 @@ erDiagram
     sales {
         TEXT id PK
         TEXT user_id FK
-        TEXT brand "brand_1 | brand_2 | brand_3"
-        TEXT status "pending | approved | rejected"
+        TEXT brand "brand_1 or brand_2 or brand_3"
+        TEXT status "pending or approved or rejected"
         REAL earning "CHECK >= 0"
         REAL advance_paid "DEFAULT 0"
-        INT advance_transferred "0 or 1 (boolean)"
-        INT reconciled "0 or 1 (boolean)"
-        TEXT created_at
-        TEXT updated_at
+        INT advance_transferred "0 or 1 boolean"
+        INT reconciled "0 or 1 boolean"
     }
 
     advance_payouts {
@@ -137,7 +126,7 @@ erDiagram
         TEXT id PK
         TEXT user_id FK
         REAL amount "CHECK > 0"
-        TEXT status "initiated | processing | completed | failed | cancelled | rejected"
+        TEXT status "initiated or completed or failed"
         TEXT failure_reason "nullable"
         TEXT initiated_at
         TEXT completed_at "nullable"
@@ -148,10 +137,9 @@ erDiagram
         TEXT user_id FK
         TEXT sale_id FK "nullable"
         TEXT payout_id FK "nullable"
-        TEXT type "advance_credit | reconciliation_credit | reconciliation_debit | failed_payout_credit"
+        TEXT type "advance or reconciliation or failed"
         REAL amount
         TEXT description "nullable"
-        TEXT created_at
     }
 
     user_balances {
@@ -171,21 +159,21 @@ erDiagram
 ### Indexes (for query performance)
 
 ```sql
-CREATE INDEX idx_sales_user_status    ON sales(user_id, status);      -- advance payout lookups
-CREATE INDEX idx_sales_status         ON sales(status);               -- batch reconciliation
-CREATE INDEX idx_advance_payouts_sale ON advance_payouts(sale_id);    -- idempotency check
-CREATE INDEX idx_payouts_user         ON payouts(user_id);            -- withdrawal history
-CREATE INDEX idx_payouts_status       ON payouts(status);             -- failed payout queries
-CREATE INDEX idx_adjustments_user     ON payout_adjustments(user_id); -- audit trail
+CREATE INDEX idx_sales_user_status    ON sales(user_id, status);
+CREATE INDEX idx_sales_status         ON sales(status);
+CREATE INDEX idx_advance_payouts_sale ON advance_payouts(sale_id);
+CREATE INDEX idx_payouts_user         ON payouts(user_id);
+CREATE INDEX idx_payouts_status       ON payouts(status);
+CREATE INDEX idx_adjustments_user     ON payout_adjustments(user_id);
 ```
 
 ### Why These Indexes?
 
-| Index | Justification |
-|-------|--------------|
-| `(user_id, status)` on sales | Composite index — advance job queries `WHERE user_id = ? AND status = 'pending'` |
-| `(status)` on sales | Batch advance job scans all pending sales |
-| `(sale_id)` on advance_payouts | Fast lookup to check if advance already paid |
+| Index | Query It Speeds Up |
+|-------|--------------------|
+| `(user_id, status)` on sales | Advance job: `WHERE user_id = ? AND status = 'pending'` |
+| `(status)` on sales | Batch job scanning all pending sales |
+| `(sale_id)` on advance_payouts | Checking if advance already paid |
 | `(user_id)` on payouts | 24-hour restriction check per user |
 | `(user_id)` on adjustments | Fetching audit trail per user |
 
@@ -198,25 +186,24 @@ CREATE INDEX idx_adjustments_user     ON payout_adjustments(user_id); -- audit t
 ```mermaid
 stateDiagram-v2
     [*] --> Pending: Sale Created
-    Pending --> Approved: Admin Reconciliation
-    Pending --> Rejected: Admin Reconciliation
+
+    Pending --> Approved: Admin Approves
+    Pending --> Rejected: Admin Rejects
+
     Approved --> [*]
     Rejected --> [*]
 
     note right of Pending
-        Eligible for 10% advance payout.
-        advance_transferred flag prevents
-        duplicate advance payments.
+        Eligible for 10% advance.
+        Flag prevents duplicate advances.
     end note
 
     note right of Approved
-        Remaining payout = earning - advance_paid
-        credited to user balance.
+        Payout = earning - advance
     end note
 
     note right of Rejected
-        Advance clawed back.
-        Adjustment = -advance_paid
+        Clawback = -advance_paid
     end note
 ```
 
@@ -224,209 +211,253 @@ stateDiagram-v2
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Initiated: User requests withdrawal
-    Initiated --> Processing: Payment gateway picks up
-    Initiated --> Failed: Transfer error
-    Initiated --> Cancelled: User/admin cancels
-    Initiated --> Rejected: Gateway rejects
-    Processing --> Completed: Transfer success
-    Processing --> Failed: Transfer error
-    Processing --> Cancelled: Cancelled mid-transfer
-    Processing --> Rejected: Gateway rejects
-    Completed --> [*]
-    Failed --> [*]: Amount credited back
-    Cancelled --> [*]: Amount credited back
-    Rejected --> [*]: Amount credited back
+    [*] --> Initiated: User Withdraws
 
-    note right of Failed
-        Balance restored.
-        User can re-withdraw.
-    end note
+    Initiated --> Processing: Gateway picks up
+    Initiated --> Completed: Direct success
+
+    Processing --> Completed: Transfer done
+
+    Initiated --> Failed: Error
+    Processing --> Failed: Error
+    Initiated --> Cancelled: User cancels
+    Initiated --> Rejected: Gateway rejects
+
+    Failed --> [*]: Balance restored
+    Cancelled --> [*]: Balance restored
+    Rejected --> [*]: Balance restored
+    Completed --> [*]: Final
 ```
 
 ---
 
-## 6. Sequence Diagrams — Core Workflows
+## 6. Core Workflow Diagrams
 
-### 6.1 Advance Payout Processing
+### 6.1 Advance Payout Flow
 
 ```mermaid
-sequenceDiagram
-    participant Admin/Job
-    participant Service as AdvancePayoutService
-    participant SaleModel as Sale Model
-    participant BalanceModel as UserBalance
-    participant AuditModel as PayoutAdjustment
-    participant DB as Database (Transaction)
+flowchart TD
+    A["🔄 Advance Job Triggered"] --> B["Find pending sales where advance_transferred = 0"]
+    B --> C{"Any eligible sales?"}
+    C -->|No| D["✅ Done — nothing to process"]
+    C -->|Yes| E["🔒 BEGIN TRANSACTION"]
+    E --> F["For each sale: calculate 10% of earning"]
+    F --> G["Set advance_transferred = 1 on sale"]
+    G --> H["Credit amount to user balance"]
+    H --> I["Log in payout_adjustments"]
+    I --> J{"More sales?"}
+    J -->|Yes| F
+    J -->|No| K["COMMIT TRANSACTION"]
+    K --> L["✅ Return summary"]
 
-    Admin/Job->>Service: processForUser(userId)
-    Service->>DB: BEGIN TRANSACTION
-    Service->>SaleModel: findPendingWithoutAdvance(userId)
-    SaleModel-->>Service: [sale1, sale2, sale3]
-
-    loop For each eligible sale
-        Service->>Service: advanceAmount = earning × 0.10
-        Service->>SaleModel: markAdvanceTransferred(saleId, amount)
-        Note over SaleModel: advance_transferred = 1 (idempotency guard)
-        Service->>BalanceModel: recordAdvance(userId, amount)
-        Note over BalanceModel: withdrawable_balance += amount
-        Service->>AuditModel: create(type: advance_credit)
-    end
-
-    Service->>DB: COMMIT
-    Service-->>Admin/Job: { processedCount, totalAdvance, details }
+    style A fill:#4a90d9,color:#fff
+    style D fill:#27ae60,color:#fff
+    style L fill:#27ae60,color:#fff
+    style E fill:#e67e22,color:#fff
+    style K fill:#e67e22,color:#fff
 ```
 
-**Idempotency guarantee:** If this job runs again, `findPendingWithoutAdvance` returns only sales where `advance_transferred = 0`. Previously processed sales are skipped.
+**Idempotency:** If this job runs again, step B filters out already-processed sales (where `advance_transferred = 1`). No double-payment ever.
 
-### 6.2 Reconciliation (Approve/Reject)
+### 6.2 Reconciliation Flow
 
 ```mermaid
-sequenceDiagram
-    participant Admin
-    participant Controller as PayoutController
-    participant Service as ReconciliationService
-    participant SaleModel as Sale Model
-    participant BalanceModel as UserBalance
-    participant AuditModel as PayoutAdjustment
-    participant DB as Database
+flowchart TD
+    A["👨‍💼 Admin Reconciles Sale"] --> B["Fetch sale by ID"]
+    B --> C{"Sale status = pending?"}
+    C -->|No| D["❌ Error: Already reconciled"]
+    C -->|Yes| E["🔒 BEGIN TRANSACTION"]
 
-    Admin->>Controller: POST /reconciliation/sale {saleId, status}
-    Controller->>Service: reconcileSale(saleId, "approved")
-    Service->>SaleModel: findById(saleId)
-    SaleModel-->>Service: sale {earning: 40, advance_paid: 4, status: "pending"}
-    Service->>DB: BEGIN TRANSACTION
+    E --> F{"New Status?"}
 
-    alt status = "approved"
-        Service->>Service: remainder = 40 - 4 = 36
-        Service->>BalanceModel: credit(userId, 36)
-        Service->>AuditModel: create(type: reconciliation_credit, amount: 36)
-    else status = "rejected"
-        Service->>Service: clawback = -4
-        Service->>BalanceModel: debit(userId, 4)
-        Service->>AuditModel: create(type: reconciliation_debit, amount: -4)
-    end
+    F -->|Approved| G["Calculate: remainder = earning - advance_paid"]
+    G --> H["Credit remainder to user balance"]
+    H --> I["Log: reconciliation_credit"]
 
-    Service->>SaleModel: updateStatus(saleId, newStatus)
-    Service->>DB: COMMIT
-    Service-->>Controller: { finalAdjustment }
-    Controller-->>Admin: 200 OK
+    F -->|Rejected| J["Calculate: clawback = advance_paid"]
+    J --> K["Debit clawback from user balance"]
+    K --> L["Log: reconciliation_debit"]
+
+    I --> M["Update sale.status"]
+    L --> M
+    M --> N["COMMIT TRANSACTION"]
+    N --> O["✅ Return adjustment details"]
+
+    style A fill:#4a90d9,color:#fff
+    style D fill:#e74c3c,color:#fff
+    style O fill:#27ae60,color:#fff
+    style G fill:#27ae60,color:#fff
+    style J fill:#e74c3c,color:#fff
 ```
 
-### 6.3 Withdrawal with 24-Hour Check
+### 6.3 Withdrawal Flow
 
 ```mermaid
-sequenceDiagram
-    participant User
-    participant Controller as PayoutController
-    participant Service as WithdrawalService
-    participant PayoutModel as Payout Model
-    participant BalanceModel as UserBalance
-    participant DB as Database
+flowchart TD
+    A["💰 User Requests Withdrawal"] --> B{"Withdrew in last 24h?"}
+    B -->|Yes| C["❌ Denied: 24-hour cooldown"]
+    B -->|No| D{"Balance >= amount?"}
+    D -->|No| E["❌ Denied: Insufficient balance"]
+    D -->|Yes| F["🔒 BEGIN TRANSACTION"]
+    F --> G["Create payout record — status: initiated"]
+    G --> H["Debit amount from withdrawable_balance"]
+    H --> I["COMMIT TRANSACTION"]
+    I --> J["✅ Return payout details"]
 
-    User->>Controller: POST /withdrawals {userId, amount: 50}
-    Controller->>Service: initiateWithdrawal(userId, 50)
-
-    Service->>PayoutModel: hasRecentWithdrawal(userId)
-    PayoutModel-->>Service: false (no withdrawal in last 24h)
-
-    Service->>BalanceModel: getBalance(userId)
-    BalanceModel-->>Service: { withdrawable_balance: 80 }
-
-    Service->>Service: 50 <= 80 ✓ Balance sufficient
-
-    Service->>DB: BEGIN TRANSACTION
-    Service->>PayoutModel: create(userId, 50)
-    Service->>BalanceModel: recordWithdrawal(userId, 50)
-    Note over BalanceModel: balance: 80→30, total_withdrawn += 50
-    Service->>DB: COMMIT
-
-    Service-->>Controller: payout record
-    Controller-->>User: 201 Created
+    style A fill:#4a90d9,color:#fff
+    style C fill:#e74c3c,color:#fff
+    style E fill:#e74c3c,color:#fff
+    style J fill:#27ae60,color:#fff
 ```
 
 ### 6.4 Failed Payout Recovery (Question 2)
 
 ```mermaid
-sequenceDiagram
-    participant Gateway as Payment Gateway
-    participant Controller as PayoutController
-    participant Service as WithdrawalService
-    participant PayoutModel as Payout Model
-    participant BalanceModel as UserBalance
-    participant AuditModel as PayoutAdjustment
-    participant DB as Database
+flowchart TD
+    A["⚠️ Payout Failed / Cancelled / Rejected"] --> B["Fetch payout by ID"]
+    B --> C{"Status = initiated or processing?"}
+    C -->|No| D["❌ Error: Cannot reverse a completed payout"]
+    C -->|Yes| E["🔒 BEGIN TRANSACTION"]
+    E --> F["Update payout status to failed"]
+    F --> G["Credit amount back to user balance"]
+    G --> H["Reverse total_withdrawn counter"]
+    H --> I["Log: failed_payout_credit in audit trail"]
+    I --> J["COMMIT TRANSACTION"]
+    J --> K["✅ User can re-withdraw the amount"]
 
-    Gateway->>Controller: POST /withdrawals/:id/fail {status: "failed", reason: "Bank error"}
-    Controller->>Service: handleFailedPayout(payoutId, "failed", "Bank error")
-
-    Service->>PayoutModel: findById(payoutId)
-    PayoutModel-->>Service: { status: "initiated", amount: 50, user_id }
-
-    Service->>Service: Validate: status is "initiated" ✓
-
-    Service->>DB: BEGIN TRANSACTION
-    Service->>PayoutModel: updateStatus(payoutId, "failed", "Bank error")
-    Service->>BalanceModel: creditFailedPayout(userId, 50)
-    Note over BalanceModel: balance: 30→80, total_withdrawn -= 50
-    Service->>AuditModel: create(type: failed_payout_credit, amount: 50)
-    Service->>DB: COMMIT
-
-    Service-->>Controller: { balanceCredited: true }
-    Controller-->>Gateway: 200 OK
-
-    Note over BalanceModel: User can now re-initiate withdrawal
+    style A fill:#e67e22,color:#fff
+    style D fill:#e74c3c,color:#fff
+    style K fill:#27ae60,color:#fff
 ```
 
 ---
 
-## 7. Complete Example Walkthrough (from Problem Statement)
+## 7. Sequence Diagrams (Detailed Interactions)
+
+### 7.1 Advance Payout — Component Interaction
 
 ```mermaid
-graph LR
-    subgraph Step1["Step 1: Create 3 Sales"]
-        S1["Sale 1: ₹40 (pending)"]
-        S2["Sale 2: ₹40 (pending)"]
-        S3["Sale 3: ₹40 (pending)"]
+sequenceDiagram
+    participant Job as Cron Job
+    participant Svc as AdvancePayoutService
+    participant Sale as Sale Model
+    participant Bal as UserBalance
+    participant Audit as PayoutAdjustment
+
+    Job->>Svc: processForUser(userId)
+
+    Svc->>Sale: findPendingWithoutAdvance(userId)
+    Sale-->>Svc: eligible sales list
+
+    loop Each eligible sale
+        Svc->>Sale: markAdvanceTransferred(saleId, 10%)
+        Svc->>Bal: recordAdvance(userId, amount)
+        Svc->>Audit: create(advance_credit)
     end
 
-    subgraph Step2["Step 2: Advance Payout (10%)"]
-        A1["Sale 1: advance ₹4"]
-        A2["Sale 2: advance ₹4"]
-        A3["Sale 3: advance ₹4"]
-        BAL1["Balance = ₹12"]
+    Svc-->>Job: processedCount, totalAdvance
+```
+
+### 7.2 Reconciliation — Component Interaction
+
+```mermaid
+sequenceDiagram
+    participant Admin
+    participant Svc as ReconciliationService
+    participant Sale as Sale Model
+    participant Bal as UserBalance
+
+    Admin->>Svc: reconcileSale(saleId, status)
+    Svc->>Sale: findById(saleId)
+    Sale-->>Svc: sale data
+
+    alt Approved
+        Svc->>Bal: credit(earning - advance_paid)
+    else Rejected
+        Svc->>Bal: debit(advance_paid)
     end
 
-    subgraph Step3["Step 3: Reconciliation"]
-        R1["Sale 1 → REJECTED: -₹4"]
-        R2["Sale 2 → APPROVED: +₹36"]
-        R3["Sale 3 → APPROVED: +₹36"]
-        BAL2["Balance = ₹80"]
+    Svc->>Sale: updateStatus(saleId, newStatus)
+    Svc-->>Admin: finalAdjustment
+```
+
+### 7.3 Failed Payout Recovery — Component Interaction
+
+```mermaid
+sequenceDiagram
+    participant GW as Payment Gateway
+    participant Svc as WithdrawalService
+    participant Pay as Payout Model
+    participant Bal as UserBalance
+    participant Audit as PayoutAdjustment
+
+    GW->>Svc: handleFailedPayout(payoutId, failed)
+    Svc->>Pay: findById(payoutId)
+    Pay-->>Svc: payout data
+
+    Svc->>Pay: updateStatus(failed)
+    Svc->>Bal: creditFailedPayout(amount)
+    Svc->>Audit: create(failed_payout_credit)
+
+    Svc-->>GW: balanceCredited = true
+```
+
+---
+
+## 8. Complete Example Walkthrough (from Problem Statement)
+
+### Visual Flow
+
+```mermaid
+flowchart LR
+    subgraph S1["1️⃣ Create Sales"]
+        direction TB
+        SA["Sale A: Rs.40"]
+        SB["Sale B: Rs.40"]
+        SC["Sale C: Rs.40"]
     end
 
-    Step1 --> Step2 --> Step3
+    subgraph S2["2️⃣ Advance 10%"]
+        direction TB
+        AA["A: +Rs.4"]
+        AB["B: +Rs.4"]
+        AC["C: +Rs.4"]
+        B1(("Bal: Rs.12"))
+    end
+
+    subgraph S3["3️⃣ Reconcile"]
+        direction TB
+        RA["A Rejected: -Rs.4"]
+        RB["B Approved: +Rs.36"]
+        RC["C Approved: +Rs.36"]
+        B2(("Bal: Rs.80"))
+    end
+
+    S1 ==> S2 ==> S3
 ```
 
 ### Step-by-Step Balance Trace
 
-| Step | Action | Balance Change | Running Balance |
-|------|--------|---------------|-----------------|
-| 0 | User created | — | ₹0 |
-| 1 | Advance on Sale 1 (₹40 × 10%) | +₹4 | ₹4 |
-| 2 | Advance on Sale 2 (₹40 × 10%) | +₹4 | ₹8 |
-| 3 | Advance on Sale 3 (₹40 × 10%) | +₹4 | ₹12 |
-| 4 | Sale 1 REJECTED → clawback advance | −₹4 | ₹8 |
-| 5 | Sale 2 APPROVED → credit remainder (₹40 − ₹4) | +₹36 | ₹44 |
-| 6 | Sale 3 APPROVED → credit remainder (₹40 − ₹4) | +₹36 | ₹80 |
+| Step | Action | Change | Balance |
+|:----:|--------|:------:|:-------:|
+| 0 | User created | — | **Rs.0** |
+| 1 | Advance on Sale A (Rs.40 x 10%) | +Rs.4 | **Rs.4** |
+| 2 | Advance on Sale B (Rs.40 x 10%) | +Rs.4 | **Rs.8** |
+| 3 | Advance on Sale C (Rs.40 x 10%) | +Rs.4 | **Rs.12** |
+| 4 | Sale A **REJECTED** → clawback advance | -Rs.4 | **Rs.8** |
+| 5 | Sale B **APPROVED** → credit remainder (Rs.40 - Rs.4) | +Rs.36 | **Rs.44** |
+| 6 | Sale C **APPROVED** → credit remainder (Rs.40 - Rs.4) | +Rs.36 | **Rs.80** |
 
-**Final Payout (post-reconciliation) = −₹4 + ₹36 + ₹36 = ₹68**  
-**Total Withdrawable Balance = ₹80** (includes ₹12 advance already credited)
+**Final Payout (post-reconciliation) = -Rs.4 + Rs.36 + Rs.36 = Rs.68**  
+**Total Withdrawable Balance = Rs.80** (includes Rs.12 advance already credited)
 
-> The ₹68 "Final Payout" from the problem statement is what remains AFTER accounting for the ₹12 advance already paid. Our system's ₹80 balance is correct — it represents the total the user can withdraw if they haven't withdrawn anything yet.
+> The Rs.68 "Final Payout" from the problem statement is what remains AFTER accounting for the Rs.12 advance already paid. Our system's Rs.80 balance is correct — it represents the total the user can withdraw if they haven't withdrawn anything yet.
 
 ---
 
-## 8. Class Design (UML-style)
+## 9. Class Design (UML-style)
+
+### Models (Data Access)
 
 ```mermaid
 classDiagram
@@ -436,7 +467,6 @@ classDiagram
         +String email
         +create(name, email) User
         +findById(id) User
-        +findByEmail(email) User
         +findAll() User[]
     }
 
@@ -448,12 +478,10 @@ classDiagram
         +Number earning
         +Number advance_paid
         +Boolean advance_transferred
-        +Boolean reconciled
         +create(userId, brand, earning) Sale
         +findPendingWithoutAdvance(userId) Sale[]
         +markAdvanceTransferred(saleId, amount)
         +updateStatus(saleId, status)
-        +getSummary(userId) Object
     }
 
     class Payout {
@@ -461,36 +489,39 @@ classDiagram
         +String user_id
         +Number amount
         +String status
-        +String failure_reason
         +create(userId, amount) Payout
         +updateStatus(id, status, reason)
         +hasRecentWithdrawal(userId) Boolean
     }
 
     class UserBalance {
-        +String user_id
         +Number withdrawable_balance
         +Number total_earned
-        +Number total_advance_paid
         +Number total_withdrawn
         +getBalance(userId) Balance
         +credit(userId, amount)
         +debit(userId, amount)
-        +recordAdvance(userId, amount)
         +recordWithdrawal(userId, amount)
         +creditFailedPayout(userId, amount)
     }
 
     class PayoutAdjustment {
         +String id
-        +String user_id
         +String type
         +Number amount
-        +String description
         +create(params) Adjustment
         +findByUser(userId) Adjustment[]
     }
 
+    User "1" --> "*" Sale : owns
+    User "1" --> "1" UserBalance : has
+    User "1" --> "*" Payout : requests
+```
+
+### Services (Business Logic)
+
+```mermaid
+classDiagram
     class AdvancePayoutService {
         +processForUser(userId) Result
         +processAll() BatchResult
@@ -508,24 +539,17 @@ classDiagram
         +handleFailedPayout(payoutId, status, reason) Result
     }
 
-    AdvancePayoutService --> Sale
-    AdvancePayoutService --> UserBalance
-    AdvancePayoutService --> PayoutAdjustment
-    ReconciliationService --> Sale
-    ReconciliationService --> UserBalance
-    ReconciliationService --> PayoutAdjustment
-    WithdrawalService --> Payout
-    WithdrawalService --> UserBalance
-    WithdrawalService --> PayoutAdjustment
-    User "1" --> "*" Sale
-    User "1" --> "1" UserBalance
-    User "1" --> "*" Payout
-    Sale "1" --> "*" PayoutAdjustment
+    AdvancePayoutService ..> Sale : reads/writes
+    AdvancePayoutService ..> UserBalance : credits
+    ReconciliationService ..> Sale : updates status
+    ReconciliationService ..> UserBalance : credits/debits
+    WithdrawalService ..> Payout : creates/updates
+    WithdrawalService ..> UserBalance : debits/credits
 ```
 
 ---
 
-## 9. API Endpoints — Complete Reference
+## 10. API Endpoints — Complete Reference
 
 ### Users
 | Method | Endpoint | Body | Response |
@@ -569,50 +593,50 @@ classDiagram
 
 ---
 
-## 10. Edge Cases & Failure Handling
+## 11. Edge Cases & Failure Handling
 
-| # | Edge Case | Handling Strategy | Code Location |
-|---|-----------|-------------------|---------------|
-| 1 | Advance job runs multiple times | `advance_transferred` boolean flag (idempotent) | `AdvancePayoutService.processForUser()` |
-| 2 | Sale reconciled twice | Status guard: only `pending` → `approved/rejected` | `ReconciliationService.reconcileSale()` |
-| 3 | Withdrawal within 24 hours | `hasRecentWithdrawal()` checks timestamp window | `WithdrawalService.initiateWithdrawal()` |
-| 4 | Insufficient balance | Pre-debit balance check with descriptive error | `WithdrawalService.initiateWithdrawal()` |
-| 5 | Marking completed payout as failed | Status guard: only `initiated/processing` can fail | `WithdrawalService.handleFailedPayout()` |
-| 6 | Negative balance after clawback | Allowed (debt tracking); withdrawals blocked at ≤ 0 | `UserBalance.debit()` |
-| 7 | Sale reconciled before advance runs | `advance_paid = 0`, so approved → full credit, rejected → no clawback | `ReconciliationService.reconcileSale()` |
-| 8 | Zero-earning sale | 10% of 0 = 0; advance recorded but no money moves | `AdvancePayoutService` |
-| 9 | Partial batch reconciliation failure | Errors collected per-sale; successful ones still commit | `ReconciliationService.batchReconcile()` |
-| 10 | Concurrent advance + withdrawal | SQLite serialized writes + transactions prevent race conditions | Database WAL mode |
+| # | Edge Case | Handling Strategy |
+|---|-----------|-------------------|
+| 1 | Advance job runs multiple times | `advance_transferred` flag — idempotent |
+| 2 | Sale reconciled twice | Status guard: only `pending` can transition |
+| 3 | Withdrawal within 24 hours | Timestamp check on recent payouts |
+| 4 | Insufficient balance | Pre-debit balance check with error |
+| 5 | Completed payout marked as failed | Status guard: only `initiated/processing` can fail |
+| 6 | Negative balance after clawback | Allowed as debt; withdrawals blocked at 0 |
+| 7 | Reconciliation before advance runs | No clawback needed; full amount credited |
+| 8 | Zero-earning sale | 10% of 0 = 0; recorded but no money moves |
+| 9 | Batch reconciliation partial failure | Per-sale error collection; successes still commit |
+| 10 | Server crash mid-operation | DB transaction auto-rollback; no partial state |
 
 ---
 
-## 11. Design Decisions & Trade-offs
+## 12. Design Decisions & Trade-offs
 
-### 11.1 Materialized Balance vs. Computed-on-Read
+### 12.1 Materialized Balance vs. Computed-on-Read
 
 | Approach | Read Cost | Write Cost | Consistency Risk |
 |----------|-----------|------------|-----------------|
-| **Materialized (chosen)** | O(1) | O(1) per update | Drift possible if write missed |
+| **Materialized (chosen)** | O(1) | O(1) per update | Drift possible |
 | Computed from adjustments | O(n) | O(1) insert only | Always consistent |
 
-**Decision:** Materialized. Payout dashboards check balance on every page load. O(1) reads are critical. The `payout_adjustments` audit trail serves as a fallback to reconstruct the true balance if drift is ever suspected.
+**Decision:** Materialized. Payout dashboards check balance on every page load. O(1) reads are critical. The `payout_adjustments` audit trail exists as a fallback to reconstruct the true balance if drift is suspected.
 
-### 11.2 Per-Sale vs. Aggregate Advance Tracking
+### 12.2 Per-Sale vs. Aggregate Advance Tracking
 
 **Decision:** Per-sale (`advance_transferred` flag + `advance_paid` amount on each sale).  
-**Why:** During reconciliation, we need to know exactly how much advance was paid for *this specific sale* to calculate the correct remainder (approved) or clawback (rejected). Aggregate tracking would require proportional splitting, which is error-prone.
+**Why:** During reconciliation, we need to know exactly how much advance was paid for *this specific sale* to calculate the correct remainder or clawback. Aggregate tracking would require proportional splitting, which is error-prone.
 
-### 11.3 Transaction Boundaries
+### 12.3 Transaction Boundaries
 
 **Decision:** Each service method wraps its entire operation in a single database transaction.  
-**Why:** Atomicity. If crediting the balance succeeds but the audit record fails, the system is in an inconsistent state. The transaction ensures all-or-nothing.
+**Why:** Atomicity. If crediting the balance succeeds but the audit record fails, the system is inconsistent. The transaction ensures all-or-nothing.
 
-### 11.4 Immutable Audit Trail
+### 12.4 Immutable Audit Trail
 
 **Decision:** `payout_adjustments` is append-only. No UPDATE or DELETE ever.  
-**Why:** Financial regulation compliance pattern. Every balance change has a traceable record. Enables dispute resolution, balance reconstruction, and forensic auditing.
+**Why:** Financial systems require full traceability. Every balance change has a traceable record. Enables dispute resolution, balance reconstruction, and forensic auditing.
 
-### 11.5 SQLite for Demonstration
+### 12.5 SQLite for Demonstration
 
 **Decision:** SQLite instead of PostgreSQL/MongoDB.  
 **Why:** Reviewer can `npm install && npm start` with zero external dependencies.  
@@ -620,18 +644,18 @@ classDiagram
 
 ---
 
-## 12. Production Considerations
+## 13. Production Considerations
 
 If this were production, I would add:
 
 | Concern | Solution |
 |---------|----------|
-| **Database** | PostgreSQL with connection pooling (pg-pool) |
-| **Concurrency** | Row-level locking (`SELECT ... FOR UPDATE`) on balance reads |
-| **Advance Job** | Cron-based scheduler (node-cron) or message queue (Bull/BullMQ) |
-| **Authentication** | JWT-based auth middleware on all endpoints |
-| **Rate Limiting** | express-rate-limit middleware per IP/user |
-| **Monitoring** | Structured logging (pino), APM (Datadog/New Relic) |
-| **Failed Payout Retry** | Exponential backoff retry queue with dead-letter |
-| **Balance Reconciliation** | Periodic job comparing materialized balance vs. sum of adjustments |
+| **Database** | PostgreSQL with connection pooling |
+| **Concurrency** | Row-level locking (`SELECT ... FOR UPDATE`) |
+| **Advance Job** | Cron scheduler or message queue (BullMQ) |
+| **Authentication** | JWT-based auth middleware |
+| **Rate Limiting** | express-rate-limit per IP/user |
+| **Monitoring** | Structured logging (pino), APM |
+| **Failed Payout Retry** | Exponential backoff with dead-letter queue |
+| **Balance Reconciliation** | Periodic job: materialized vs. sum of adjustments |
 | **API Versioning** | `/api/v1/` prefix for backward compatibility |
